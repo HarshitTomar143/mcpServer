@@ -1,151 +1,155 @@
-# server.py
-import asyncio
-import subprocess
+"""
+server.py — Central MCP Orchestrator (manual tool registration)
+Compatible with FastMCP versions that require manual mcp.add_tool(...) registration.
+"""
+
 import time
-from typing import Dict, Any
-from mcp.server.fastmcp import FastMCP, Context
-
-# Initialize the MCP Server
-mcp = FastMCP("NeuroWeave-Supervisor")
-
-AGENTS: Dict[str, Dict[str, Any]] = {}
-HEALTH_LOG = []
-HEARTBEAT_TIMEOUT = 8
-
+from typing import Dict, Any, Optional
+import httpx
+from fastmcp import FastMCP  # import the core only, avoid decorator imports
 
 # ------------------------------------------------------------
-# Utility Logging
+# Configuration
 # ------------------------------------------------------------
-def log_event(event: str):
-    ts = time.time()
-    HEALTH_LOG.append({"ts": ts, "event": event})
-    print(f"[{time.strftime('%H:%M:%S', time.localtime(ts))}] {event}")
+SERVER_NAME = "mcp-central-hub"
+AGENTS: Dict[str, str] = {
+    "finance-agent": "http://127.0.0.1:8001",
+    "data-agent": "http://127.0.0.1:8002",
+    "math-agent": "http://127.0.0.1:8003",
+    "health-agent": "http://127.0.0.1:8004",
+    "summarizer-gemini": "http://127.0.0.1:8005",
+}
 
-
-# ------------------------------------------------------------
-# Agent Management
-# ------------------------------------------------------------
-def register_agent(name: str, run_cmd: str | None = None):
-    """Registers an agent and optionally defines its run command."""
-    AGENTS[name] = {"status": "unknown", "last_seen": 0.0, "run_cmd": run_cmd}
-    log_event(f"Agent registered: {name}")
-
-
-@mcp.tool()
-def get_agent_status(name: str) -> Dict[str, Any]:
-    """Get status of a specific agent"""
-    agent = AGENTS.get(name)
-    if not agent:
-        return {"error": "agent_not_found"}
-    return {"name": name, "status": agent["status"], "last_seen": agent["last_seen"]}
-
-
-@mcp.tool()
-async def list_agents() -> Dict[str, Any]:
-    """List all registered agents and their statuses"""
-    return {name: {"status": v["status"], "last_seen": v["last_seen"]} for name, v in AGENTS.items()}
-
+# Create the FastMCP orchestrator
+mcp = FastMCP(SERVER_NAME, version="1.0.0")  # use 1.x style for compatibility
 
 # ------------------------------------------------------------
-# Auto-repair / Restart Logic
+# Helper - synchronous HTTP calls (simple and reliable)
 # ------------------------------------------------------------
-async def _attempt_restart_agent(name: str) -> bool:
-    agent = AGENTS.get(name)
-    if not agent:
-        log_event(f"Repair failed: {name} not found")
-        return False
+def call_agent_sync(agent: str, endpoint: str, data: Optional[dict] = None, timeout: float = 15.0) -> dict:
+    """
+    Synchronously call agent HTTP endpoints using httpx.Client.
+    Returns a dict with either the JSON response or an error description.
+    """
+    if agent not in AGENTS:
+        return {"error": f"Agent '{agent}' not found"}
 
-    run_cmd = agent.get("run_cmd")
-    if not run_cmd:
-        log_event(f"No run_cmd for {name}; cannot auto-restart.")
-        return False
-
-    log_event(f"Attempting to restart agent {name} with: {run_cmd}")
+    base_url = AGENTS[agent].rstrip("/")
+    url = f"{base_url}/{endpoint.lstrip('/')}"
     try:
-        subprocess.Popen(run_cmd, shell=True)
-        agent["status"] = "recovering"
-        agent["last_seen"] = time.time()
-        log_event(f"Restart triggered for {name}")
-        return True
+        with httpx.Client(timeout=timeout) as client:
+            if data is not None:
+                resp = client.post(url, json=data)
+            else:
+                resp = client.get(url)
+            resp.raise_for_status()
+            # try to parse JSON; fallback to text
+            try:
+                return resp.json()
+            except Exception:
+                return {"status": "ok", "text": resp.text}
     except Exception as e:
-        log_event(f"Restart error for {name}: {e}")
-        return False
-
-
-@mcp.tool()
-async def repair_agent(name: str, ctx: Context | None = None) -> Dict[str, Any]:
-    """Manually trigger repair for a given agent"""
-    if name not in AGENTS:
-        return {"ok": False, "error": "agent_not_found"}
-
-    log_event(f"repair_agent called for {name}")
-    ok = await _attempt_restart_agent(name)
-    return {"ok": ok, "agent": name}
-
+        return {"error": str(e), "agent": agent}
 
 # ------------------------------------------------------------
-# Health Resource & Prompt
+# Tools implemented as plain functions (accept generic payloads)
 # ------------------------------------------------------------
-@mcp.resource("neuroweave://health-log")
-def health_log_resource() -> str:
-    """Returns the last 200 health log entries"""
-    lines = [
-        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ev['ts']))} - {ev['event']}"
-        for ev in HEALTH_LOG[-200:]
-    ]
-    return "\n".join(lines)
+def list_agents_tool(payload: Optional[dict] = None) -> dict:
+    """Return the registered agents and their base URLs."""
+    return {"status": "ok", "agents": AGENTS, "ts": time.time()}
 
+def health_all_tool(payload: Optional[dict] = None) -> dict:
+    """Query /health on all agents and return aggregated results."""
+    results: Dict[str, Any] = {}
+    for name in AGENTS.keys():
+        results[name] = call_agent_sync(name, "health")
+    return {"status": "ok", "timestamp": time.time(), "results": results}
 
-@mcp.prompt()
-def repair_prompt(agent_name: str, severity: str = "medium") -> str:
-    """Provides an instruction prompt for the operator"""
-    return (
-        f"You are an operator agent. Agent `{agent_name}` has {severity} severity. "
-        f"Check logs, restart the service if safe, and verify heartbeat."
-    )
+def call_agent_tool(payload: Optional[dict]) -> dict:
+    """
+    Generic tool to call another agent's /call endpoint.
+    Expected payload format (flexible):
+      {
+        "agent": "math-agent",
+        "query": "some_query_name",
+        "input": { ... }   # optional
+      }
+    """
+    if not payload or not isinstance(payload, dict):
+        return {"error": "payload must be an object with agent and query keys"}
 
+    agent = payload.get("agent")
+    query = payload.get("query")
+    input_data = payload.get("input", {})
+
+    if not agent or not query:
+        return {"error": "agent and query are required in payload"}
+
+    # build MCP-style call payload for agent
+    call_payload = {"input": {"query": query}}
+    if isinstance(input_data, dict):
+        call_payload["input"].update(input_data)
+
+    result = call_agent_sync(agent, "call", call_payload)
+    return {"status": "ok", "agent": agent, "result": result}
+
+def summarize_with_gemini_tool(payload: Optional[dict]) -> dict:
+    """
+    Convenience wrapper that calls the summarizer agent's /call endpoint.
+    Accepts payload like:
+      {"text": "..."}  OR  {"input": {"text": "..."}}  OR same shape as call_agent_tool
+    """
+    if not payload or not isinstance(payload, dict):
+        return {"error": "payload must be an object containing text"}
+
+    # accept flexible shapes
+    if "input" in payload and isinstance(payload["input"], dict):
+        text = payload["input"].get("text") or payload["input"].get("body")
+    else:
+        text = payload.get("text") or payload.get("body")
+
+    if not text:
+        return {"error": "text required (payload.text or payload.input.text)"}
+
+    agent_payload = {"input": {"text": text}}
+    result = call_agent_sync("summarizer-gemini", "call", agent_payload)
+    return {"status": "ok", "summary": result}
 
 # ------------------------------------------------------------
-# Monitoring Loop
+# Minimal compatibility: attach `.key` and metadata expected by older fastmcp
 # ------------------------------------------------------------
-async def monitor_loop():
-    """Continuously monitors all agents and restarts them if unresponsive."""
-    while True:
-        now = time.time()
-        for name, info in list(AGENTS.items()):
-            last = info.get("last_seen", 0.0)
-            status = info.get("status", "unknown")
-            if last == 0:
-                continue
-            if now - last > HEARTBEAT_TIMEOUT and status == "healthy":
-                AGENTS[name]["status"] = "unhealthy"
-                log_event(f"Auto-detected failure for {name}; initiating repair")
-                await _attempt_restart_agent(name)
-        await asyncio.sleep(3)
+# Some fastmcp tool managers expect callables to expose a `.key` attribute.
+# Provide them so mcp.add_tool(...) works reliably.
+list_agents_tool.key = "list_agents"
+list_agents_tool.description = "List registered agents"
 
+health_all_tool.key = "health_all"
+health_all_tool.description = "Get /health from all agents"
+
+call_agent_tool.key = "call_agent_tool"
+call_agent_tool.description = "Proxy a call to a specific agent's /call endpoint"
+
+summarize_with_gemini_tool.key = "summarize_with_gemini"
+summarize_with_gemini_tool.description = "Summarize text via the Gemini summarizer agent"
 
 # ------------------------------------------------------------
-# Startup Handler (Replaces @mcp.on_startup)
+# Register the tools with the MCP server (manual registration)
 # ------------------------------------------------------------
-async def startup(ctx: Context):
-    """Startup logic that registers and launches agents."""
-    register_agent("WeatherAgent", run_cmd="python demo_agents/weather_agent.py")
-    register_agent("FinanceAgent", run_cmd="python demo_agents/finance_agent.py")
-    register_agent("TrafficAgent", run_cmd="python demo_agents/traffic_agent.py")
-
-    for a in AGENTS:
-        AGENTS[a]["status"] = "unknown"
-
-    log_event("Supervisor startup complete; launching monitor loop.")
-    asyncio.create_task(monitor_loop())
-
-
-# Attach startup handler manually
-mcp.startup_handler = startup
-
+# older FastMCP builds use mcp.add_tool(func)
+mcp.add_tool(list_agents_tool)
+mcp.add_tool(health_all_tool)
+mcp.add_tool(call_agent_tool)
+mcp.add_tool(summarize_with_gemini_tool)
 
 # ------------------------------------------------------------
-# Entry Point
+# Start message and run
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    asyncio.run(mcp.start())
+    print("\n🚀 MCP Central Hub (manual registration) starting.")
+    print("🔗 Connected agents:")
+    for a, url in AGENTS.items():
+        print(f"  - {a}: {url}")
+    print("✅ Registered tools: list_agents, health_all, call_agent_tool, summarize_with_gemini\n")
+
+    # run the MCP server (blocking)
+    mcp.run()

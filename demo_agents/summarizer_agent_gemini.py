@@ -1,64 +1,51 @@
-# summarizer_agent_gemini.py
-import os
-import time
+# append or create a new file demo_agents/summarizer_agent_http.py
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import google.generativeai as genai
-from dotenv import load_dotenv
+import uvicorn
+import asyncio
+import os
+import time
 
-# Load environment variables from .env file
-load_dotenv()
+# import the summarizer functions from your MCP file
+# assume your MCP file defines `health` and `summarize` functions and registers them with mcp
+# adjust import path if needed:
+from demo_agents import summarizer_agent_gemini as mcp_agent
 
-app = FastAPI(title="SummarizerAgent-Gemini")
-AGENT_NAME = "summarizer-gemini"
-
-# Initialize Gemini client.
-API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-
-if API_KEY:
-    genai.configure(api_key=API_KEY)
-else:
-    raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY environment variable is required")
-
-# Choose a model — using a model that's known to be available
-MODEL_NAME = "gemini-flash-latest" 
+app = FastAPI(title="SummarizerAgentHTTP")
 
 class CallIn(BaseModel):
-    input: dict
-    meta: dict = {}
-
-class CallOut(BaseModel):
-    status: str
-    result: dict
+    input: dict = {}
     meta: dict = {}
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "agent": AGENT_NAME, "ts": time.time()}
+async def health():
+    # Use the same health function logic (call it directly)
+    try:
+        # if your function expects payload, pass None
+        return mcp_agent.health(None)
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 @app.post("/call")
-def call(payload: CallIn):
-    text = payload.input.get("text", "")
-    if not text or not text.strip():
-        raise HTTPException(status_code=400, detail="text is required in input.text")
+async def call(payload: CallIn):
+    # Route calls to the summarize tool (or generalize based on payload)
+    inp = payload.input or {}
+    # support two shapes: {"query":"summarize", "text": "..."} or {"text":"..."}
+    query = inp.get("query") or inp.get("op") or "summarize"
+    if query != "summarize":
+        raise HTTPException(status_code=400, detail="only 'summarize' supported in this HTTP wrapper")
 
-    
-    prompt = (
-        "Summarize the following text into a short, 2-4 bullet point summary. "
-        "Keep it factual and concise.\n\n"
-        f"TEXT:\n{text}"
-    )
-
+    # forward payload to your function:
     try:
-        # Create the model
-        model = genai.GenerativeModel(MODEL_NAME)
-        
-        # Generate content
-        response = model.generate_content(prompt)
-        
-        # Extract the text from the response
-        summary_text = response.text if response and hasattr(response, 'text') else "Failed to generate summary"
+        # your summarize expects either a dict with 'text' or the Pydantic model
+        # use dict form to be robust
+        body = {"text": inp.get("text") or inp.get("input", {}).get("text") or ""}
+        result = mcp_agent.summarize(body)
+        return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini request failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return CallOut(status="ok", result={"summary": summary_text.strip()}, meta={"agent": AGENT_NAME})
+# Only start uvicorn if run as a script (optional)
+if __name__ == "__main__":
+    uvicorn.run("demo_agents.summarizer_agent_http:app", host="127.0.0.1", port=8005, reload=False)
